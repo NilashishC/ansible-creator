@@ -201,12 +201,7 @@ class EEConfig:
         additional_build_steps: Custom build steps keyed by phase.
         options: Build options (e.g. package_manager_path).
         ansible_cfg: Content for an ansible.cfg file.
-<<<<<<< HEAD
-        automation_hub_url: Red Hat Automation Hub content URL.
-        private_hub_url: On-prem Private Automation Hub URL (enables private_hub server when set).
-=======
         ee_file_name: Name of the EE definition file (default: execution-environment.yml).
->>>>>>> cidrblock/feat/ee-file-name
     """
 
     name: str = "ansible_sample_ee"
@@ -218,12 +213,7 @@ class EEConfig:
     additional_build_steps: dict[str, list[str]] = field(default_factory=dict)
     options: dict[str, Any] = field(default_factory=dict)
     ansible_cfg: str = ""
-<<<<<<< HEAD
-    automation_hub_url: str = "https://console.redhat.com/api/automation-hub/content/published/"
-    private_hub_url: str = ""
-=======
     ee_file_name: str = "execution-environment.yml"
->>>>>>> cidrblock/feat/ee-file-name
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> EEConfig:
@@ -253,17 +243,9 @@ class EEConfig:
             additional_build_steps=data.get("additional_build_steps", {}),
             options=dict(data.get("options", {})),
             ansible_cfg=data.get("ansible_cfg", ""),
-<<<<<<< HEAD
-            automation_hub_url=data.get(
-                "automation_hub_url",
-                "https://console.redhat.com/api/automation-hub/content/published/",
-            ),
-            private_hub_url=data.get("private_hub_url", ""),
-=======
             ee_file_name=cls._validate_ee_file_name(
                 data.get("ee_file_name", "execution-environment.yml"),
             ),
->>>>>>> cidrblock/feat/ee-file-name
         )
 
     @staticmethod
@@ -345,25 +327,10 @@ class EEConfig:
                     "description": "Content for ansible.cfg file",
                     "default": "",
                 },
-<<<<<<< HEAD
-                "automation_hub_url": {
-                    "type": "string",
-                    "description": "Red Hat Automation Hub content URL",
-                    "default": "https://console.redhat.com/api/automation-hub/content/published/",
-                },
-                "private_hub_url": {
-                    "type": "string",
-                    "description": (
-                        "On-prem Private Automation Hub URL "
-                        "(enables private_hub server section in ansible.cfg when set)"
-                    ),
-                    "default": "",
-=======
                 "ee_file_name": {
                     "type": "string",
                     "description": "Name of the EE definition file",
                     "default": "execution-environment.yml",
->>>>>>> cidrblock/feat/ee-file-name
                 },
             },
         }
@@ -439,12 +406,7 @@ class TemplateData:
         is_official_ee: Whether the base image is an official Red Hat EE image.
         ee_python_path: Python interpreter path for the EE (varies by AAP version).
         ee_name_is_default: Whether ee_name is the unchanged default value.
-<<<<<<< HEAD
-        ee_automation_hub_url: Red Hat Automation Hub content URL.
-        ee_private_hub_url: On-prem Private Automation Hub URL.
-=======
         ee_file_name: Name of the EE definition file.
->>>>>>> cidrblock/feat/ee-file-name
     """
 
     resource_type: str = ""
@@ -476,9 +438,4 @@ class TemplateData:
     is_official_ee: bool = False
     ee_python_path: str = DEFAULT_PYTHON_PATH
     ee_name_is_default: bool = True
-<<<<<<< HEAD
-    ee_automation_hub_url: str = "https://console.redhat.com/api/automation-hub/content/published/"
-    ee_private_hub_url: str = ""
-=======
     ee_file_name: str = "execution-environment.yml"
->>>>>>> cidrblock/feat/ee-file-name
