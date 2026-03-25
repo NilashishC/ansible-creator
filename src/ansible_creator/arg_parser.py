@@ -433,14 +433,14 @@ class Parser:
         self._add_args_common(parser)
 
     def _add_resource_ee_ci(self, subparser: SubParser[argparse.ArgumentParser]) -> None:
-        """Add EE CI GitHub Action workflow to an existing path.
+        """Add EE CI workflow to an existing path.
 
         Args:
             subparser: The subparser to add EE CI workflow to
         """
         parser = subparser.add_parser(
             "ee-ci",
-            help="Add a GitHub Action CI workflow for building execution environments.",
+            help="Add a CI workflow for building execution environments.",
         )
 
         parser.add_argument(
@@ -450,6 +450,14 @@ class Parser:
             nargs="?",
             help="The destination directory for the EE CI workflow. "
             "The default is the current working directory.",
+        )
+
+        parser.add_argument(
+            "--scm-provider",
+            dest="scm_provider",
+            default="github",
+            choices=["github", "gitlab"],
+            help="SCM provider to generate CI workflow for.",
         )
 
         self._add_overwrite(parser)
@@ -822,6 +830,14 @@ class Parser:
             type=EEConfig._validate_ee_file_name,  # noqa: SLF001
             help="Name of the EE definition file. "
             "Must end with .yml or .yaml. Default: execution-environment.yml",
+        )
+
+        parser.add_argument(
+            "--scm-provider",
+            dest="scm_provider",
+            default="github",
+            choices=["github", "gitlab"],
+            help="SCM provider to generate CI workflow for.",
         )
 
         self._add_args_common(parser)

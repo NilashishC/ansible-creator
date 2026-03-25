@@ -13,7 +13,7 @@ from ansible_creator.constants import GLOBAL_TEMPLATE_VARS
 from ansible_creator.exceptions import CreatorError
 from ansible_creator.templar import Templar
 from ansible_creator.types import TemplateData
-from ansible_creator.utils import Copier, FileList, Walker, ask_yes_no
+from ansible_creator.utils import Copier, DestinationFile, FileList, Walker, ask_yes_no
 
 
 if TYPE_CHECKING:
@@ -52,6 +52,7 @@ class Add:
         self._collection_name: str = config.collection_name or ""
 
         self._skip_collection_check = config.skip_collection_check
+        self._scm_provider: str = config.scm_provider
 
     @property
     def _plugin_type_output(self) -> str:
@@ -201,6 +202,10 @@ class Add:
             templar=self.templar,
         )
         paths = walker.collect_paths()
+
+        if self._resource_type == "ee-ci":
+            paths = self._filter_scm_paths(paths)
+
         copier = Copier(output=self.output)
 
         if self._no_overwrite and paths.has_conflicts():
@@ -461,6 +466,48 @@ class Add:
             collection_name=self._collection_name,
             creator_version=self._creator_version,
         )
+
+    @staticmethod
+    def _is_github_path(dest: DestinationFile) -> bool:
+        """Check whether a destination file belongs to the GitHub CI tree.
+
+        Args:
+            dest: The destination file to check.
+
+        Returns:
+            True if the path is under .github/.
+        """
+        return ".github" in dest.dest.parts
+
+    @staticmethod
+    def _is_gitlab_path(dest: DestinationFile) -> bool:
+        """Check whether a destination file belongs to GitLab CI.
+
+        Args:
+            dest: The destination file to check.
+
+        Returns:
+            True if the filename is .gitlab-ci.yml.
+        """
+        return dest.dest.name == ".gitlab-ci.yml"
+
+    def _filter_scm_paths(self, paths: FileList) -> FileList:
+        """Filter ee-ci paths to only include files for the selected SCM provider.
+
+        Args:
+            paths: The FileList of all collected paths.
+
+        Returns:
+            FileList with only the paths matching the chosen SCM provider.
+        """
+        filtered = FileList()
+        for path in paths:
+            if self._scm_provider == "github" and self._is_gitlab_path(path):
+                continue
+            if self._scm_provider == "gitlab" and self._is_github_path(path):
+                continue
+            filtered.append(path)
+        return filtered
 
     def _plugin_file_conflicts(self, paths: FileList) -> FileList:
         """Filter out conflicting files for plugins.

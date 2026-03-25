@@ -1,0 +1,376 @@
+---
+# Execution Environment Build and Publish Pipeline (GitLab CI/CD)
+# Features:
+# - Galaxy server token configuration checks
+# - Support for private collection repositories (Git SCM tokens)
+# - Base image lifecycle checks
+# - Production release workflow with tagging
+# - Registry authentication for build and push
+#
+# Required CI/CD Variables (Settings > CI/CD > Variables):
+#   Galaxy server tokens follow the Ansible naming convention:
+#     ANSIBLE_GALAXY_SERVER_<ID>_TOKEN
+#   where <ID> matches the [galaxy_server.<id>] section in ansible.cfg.
+#   AAP_EE_BUILDER_GITHUB_TOKEN  - GitHub PAT for private collections
+#   AAP_EE_BUILDER_GITLAB_TOKEN  - GitLab PAT for private collections
+#   SCM_TOKEN                    - Generic SCM token for custom Git servers
+#   REGISTRY_USERNAME/REGISTRY_PASSWORD - Container registry credentials
+#                                        (omit to use GitLab Container Registry tokens)
+#   REDHAT_REGISTRY_USERNAME/REDHAT_REGISTRY_PASSWORD - Red Hat registry for base images
+#
+# Token Security:
+#   Galaxy server tokens are passed via Containerfile ARG directives and
+#   --build-arg, which are available during the build but do NOT persist
+#   in the final image (not in layers, metadata, or history).
+#   The ansible.cfg (server URLs only, no tokens) is volume-mounted into
+#   the build and also never enters any OCI layer.
+#   Mark all token variables as "Masked" in GitLab CI/CD settings.
+#
+# Runner Requirements:
+#   This pipeline requires buildah and podman.  Either:
+#   - Use a shell executor on a host with these tools installed, or
+#   - Use the default image below with a Docker/Kubernetes executor that
+#     supports privileged containers (or has /dev/fuse access).
+#   If using a container-based executor with VFS storage, set
+#   STORAGE_DRIVER=vfs in your CI/CD variables.
+
+stages:
+  - validate
+  - check
+  - build
+  - release
+  - summary
+
+# Pipeline runs on tag pushes, manual web triggers, API triggers, or
+# upstream pipeline triggers.
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "api"
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+
+default:
+  image: quay.io/buildah/stable
+
+variables:
+  # Container registry (override via CI/CD Variables or manual pipeline trigger)
+  REGISTRY: "ghcr.io"
+  IMAGE_NAME: "$CI_PROJECT_PATH"
+  # EE directory and file name
+  EE_DIR: "."
+  EE_FILE_NAME: "execution-environment.yml"
+  # Base image age thresholds (in days) - informational only, never blocks the build
+  IMAGE_WARN_AGE: "40"
+  IMAGE_FAIL_AGE: "80"
+  # Set to "true" when triggering manually to skip base image validation
+  SKIP_BASE_IMAGE_VALIDATION: "false"
+
+# ============================================================================
+# Validation Stage
+# ============================================================================
+validate-tokens:
+  stage: validate
+  image: alpine:latest
+  script:
+    - GALAXY_CONFIGURED=false
+    - echo "No galaxy server tokens configured for this project"
+    - echo "GALAXY_TOKENS_CONFIGURED=$GALAXY_CONFIGURED" >> validate.env
+    - |
+      GIT_CONFIGURED=false
+      if [ -n "$AAP_EE_BUILDER_GITHUB_TOKEN" ] || \
+         [ -n "$AAP_EE_BUILDER_GITLAB_TOKEN" ] || \
+         [ -n "$SCM_TOKEN" ]; then
+        GIT_CONFIGURED=true
+        echo "Git SCM token is configured for private collection repositories"
+      else
+        echo "No Git SCM token configured, private Git repositories will not be accessible"
+      fi
+      echo "GIT_TOKEN_CONFIGURED=$GIT_CONFIGURED" >> validate.env
+  artifacts:
+    reports:
+      dotenv: validate.env
+
+check-base-image:
+  stage: check
+  allow_failure: true
+  rules:
+    - if: $SKIP_BASE_IMAGE_VALIDATION == "true"
+      when: never
+    - when: on_success
+  script:
+    - |
+      # Login to Red Hat registry if credentials are configured
+      if [ -n "$REDHAT_REGISTRY_USERNAME" ]; then
+        echo "$REDHAT_REGISTRY_PASSWORD" | \
+          podman login -u "$REDHAT_REGISTRY_USERNAME" \
+          --password-stdin registry.redhat.io
+      fi
+    - |
+      EE_DEF="${EE_DIR}/${EE_FILE_NAME}"
+
+      # Handle both flat and nested (v3) EE spec formats
+      BASE_IMAGE=""
+      if command -v yq &> /dev/null; then
+        BASE_IMAGE=$(yq -r '.images.base_image.name // .images.base_image // empty' \
+          "$EE_DEF" 2>/dev/null || echo "")
+      fi
+      if [ -z "$BASE_IMAGE" ]; then
+        BASE_IMAGE=$(grep -A2 'base_image:' "$EE_DEF" | \
+          grep -oP 'name:\s*\K\S+' || \
+          grep -oP 'base_image:\s*\K\S+' "$EE_DEF" || echo "")
+        BASE_IMAGE=$(echo "$BASE_IMAGE" | tr -d '"' | tr -d "'" | head -1)
+      fi
+      echo "Base image: $BASE_IMAGE"
+    - |
+      if [ -z "$BASE_IMAGE" ]; then
+        echo "WARNING: Could not determine base image, skipping age check"
+        echo "IMAGE_AGE_DAYS=0" >> check.env
+        echo "IMAGE_STATUS=unknown" >> check.env
+        exit 0
+      fi
+
+      if ! podman pull "$BASE_IMAGE" 2>/dev/null; then
+        echo "WARNING: Could not pull base image, skipping age check"
+        echo "IMAGE_AGE_DAYS=0" >> check.env
+        echo "IMAGE_STATUS=unknown" >> check.env
+        exit 0
+      fi
+
+      # Get image creation date
+      CREATED=$(podman inspect "$BASE_IMAGE" \
+        --format '{{.Created}}' 2>/dev/null || echo "")
+      if [ -z "$CREATED" ]; then
+        echo "WARNING: Could not determine image creation date"
+        echo "IMAGE_AGE_DAYS=0" >> check.env
+        echo "IMAGE_STATUS=unknown" >> check.env
+        exit 0
+      fi
+
+      # Calculate age in days
+      CREATED_EPOCH=$(date -d "$CREATED" +%s 2>/dev/null || echo "0")
+      CURRENT_EPOCH=$(date +%s)
+      AGE_DAYS=$(( (CURRENT_EPOCH - CREATED_EPOCH) / 86400 ))
+
+      echo "Base image is $AGE_DAYS days old"
+      echo "IMAGE_AGE_DAYS=$AGE_DAYS" >> check.env
+
+      if [ "$AGE_DAYS" -gt "$IMAGE_FAIL_AGE" ]; then
+        echo "WARNING: Base image is more than $IMAGE_FAIL_AGE days old. Consider updating."
+        echo "IMAGE_STATUS=stale" >> check.env
+      elif [ "$AGE_DAYS" -gt "$IMAGE_WARN_AGE" ]; then
+        echo "WARNING: Base image is more than $IMAGE_WARN_AGE days old. Consider updating soon."
+        echo "IMAGE_STATUS=warning" >> check.env
+      else
+        echo "IMAGE_STATUS=ok" >> check.env
+      fi
+  artifacts:
+    reports:
+      dotenv: check.env
+
+# ============================================================================
+# Build Stage
+# ============================================================================
+build:
+  stage: build
+  resource_group: ee-build-$CI_COMMIT_REF_NAME
+  needs:
+    - job: validate-tokens
+      artifacts: true
+    - job: check-base-image
+      artifacts: true
+      optional: true
+  before_script:
+    - |
+      echo -e "\e[0Ksection_start:$(date +%s):setup_python[collapsed=true]\r\e[0KSetup Python and ansible-builder"
+      if ! command -v python3 &> /dev/null; then
+        if command -v dnf &> /dev/null; then
+          dnf install -y python3 python3-pip
+        elif command -v apt-get &> /dev/null; then
+          apt-get update && apt-get install -y python3 python3-pip
+        fi
+      fi
+      python3 -m pip install --upgrade pip
+      pip3 install ansible-builder ansible-core
+      echo -e "\e[0Ksection_end:$(date +%s):setup_python\r\e[0K"
+  script:
+    # Configure Git credentials for private repositories
+    - |
+      if [ "$GIT_TOKEN_CONFIGURED" = "true" ]; then
+        git config --global credential.helper store
+
+        if [ -n "$AAP_EE_BUILDER_GITHUB_TOKEN" ]; then
+          echo "https://x-access-token:${AAP_EE_BUILDER_GITHUB_TOKEN}@github.com" >> ~/.git-credentials
+          echo "Configured GitHub credentials for private repositories"
+        fi
+
+        if [ -n "$AAP_EE_BUILDER_GITLAB_TOKEN" ]; then
+          echo "https://oauth2:${AAP_EE_BUILDER_GITLAB_TOKEN}@gitlab.com" >> ~/.git-credentials
+          echo "Configured GitLab credentials for private repositories"
+        fi
+
+        if [ -n "$SCM_TOKEN" ] && [ -n "$SCM_SERVER" ]; then
+          echo "https://token:${SCM_TOKEN}@${SCM_SERVER}" >> ~/.git-credentials
+          echo "Configured generic SCM credentials"
+        fi
+
+        if [ -f ~/.git-credentials ]; then
+          chmod 600 ~/.git-credentials
+        fi
+      fi
+
+    # Login to container registry (falls back to GitLab built-in tokens)
+    - |
+      echo "${REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD}" | \
+        buildah login -u "${REGISTRY_USERNAME:-$CI_REGISTRY_USER}" \
+        --password-stdin "$REGISTRY"
+
+    # Login to Red Hat registry for base images
+    - |
+      if [ -n "$REDHAT_REGISTRY_USERNAME" ]; then
+        echo "$REDHAT_REGISTRY_PASSWORD" | \
+          buildah login -u "$REDHAT_REGISTRY_USERNAME" \
+          --password-stdin registry.redhat.io
+      fi
+
+    # Create build context with ansible-builder
+    - |
+      echo -e "\e[0Ksection_start:$(date +%s):create_context\r\e[0KCreating build context"
+      echo "EE directory: ${EE_DIR}"
+
+      export ANSIBLE_CONFIG=./ansible.cfg
+
+      # Resolve SCM token references (e.g. ${AAP_EE_BUILDER_GITHUB_TOKEN} in
+      # collection URLs) into a temp copy so the workspace file stays clean.
+      EE_FILE="${EE_DIR}/${EE_FILE_NAME}"
+      if command -v envsubst &> /dev/null; then
+        envsubst '$AAP_EE_BUILDER_GITHUB_TOKEN $AAP_EE_BUILDER_GITLAB_TOKEN $SCM_TOKEN' \
+          < "$EE_FILE" > /tmp/ee-resolved.yml
+        EE_FILE="/tmp/ee-resolved.yml"
+      fi
+
+      ansible-builder create --file "$EE_FILE" --output-filename Containerfile
+      echo -e "\e[0Ksection_end:$(date +%s):create_context\r\e[0K"
+
+    # Build the image
+    - |
+      echo -e "\e[0Ksection_start:$(date +%s):build_image\r\e[0KBuilding image"
+
+      # Volume-mount ansible.cfg into the build (never enters any OCI layer).
+      # Ansible reads /etc/ansible/ansible.cfg as a fallback config path.
+      EXTRA_ARGS=""
+      if [ -f "${EE_DIR}/ansible.cfg" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --volume $(pwd)/${EE_DIR}/ansible.cfg:/etc/ansible/ansible.cfg:ro"
+      fi
+
+      # shellcheck disable=SC2086
+      buildah bud $EXTRA_ARGS \
+        --tag "${REGISTRY}/${IMAGE_NAME}:build-${CI_COMMIT_SHA}" \
+        --file context/Containerfile \
+        context/
+      echo -e "\e[0Ksection_end:$(date +%s):build_image\r\e[0K"
+
+    # Test execution environment
+    - |
+      echo -e "\e[0Ksection_start:$(date +%s):test_ee\r\e[0KTesting EE"
+      podman run --rm "${REGISTRY}/${IMAGE_NAME}:build-${CI_COMMIT_SHA}" \
+        ansible --version
+      podman run --rm "${REGISTRY}/${IMAGE_NAME}:build-${CI_COMMIT_SHA}" \
+        ansible-galaxy collection list
+      echo -e "\e[0Ksection_end:$(date +%s):test_ee\r\e[0K"
+
+    # Push image
+    - |
+      buildah push --digestfile /tmp/digest \
+        "${REGISTRY}/${IMAGE_NAME}:build-${CI_COMMIT_SHA}" \
+        "docker://${REGISTRY}/${IMAGE_NAME}:build-${CI_COMMIT_SHA}"
+      echo "IMAGE_DIGEST=$(cat /tmp/digest)" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# ============================================================================
+# Release Stage
+# ============================================================================
+release:
+  stage: release
+  resource_group: ee-build-$CI_COMMIT_REF_NAME
+  needs:
+    - job: build
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    # Login to container registry
+    - |
+      echo "${REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD}" | \
+        buildah login -u "${REGISTRY_USERNAME:-$CI_REGISTRY_USER}" \
+        --password-stdin "$REGISTRY"
+
+    # Tag and push release
+    - |
+      VERSION="$CI_COMMIT_TAG"
+
+      # Pull the image built from this commit (pushed in build job)
+      buildah pull "${REGISTRY}/${IMAGE_NAME}:build-${CI_COMMIT_SHA}"
+
+      # Backup previous production tag if it exists
+      if buildah pull "${REGISTRY}/${IMAGE_NAME}:prd" 2>/dev/null; then
+        echo "Backing up previous production image to 'previous' tag"
+        buildah tag "${REGISTRY}/${IMAGE_NAME}:prd" \
+          "${REGISTRY}/${IMAGE_NAME}:previous"
+        buildah push "${REGISTRY}/${IMAGE_NAME}:previous"
+      fi
+
+      # Tag and push version, latest, and production
+      for TAG in "$VERSION" "latest" "prd"; do
+        buildah tag "${REGISTRY}/${IMAGE_NAME}:build-${CI_COMMIT_SHA}" \
+          "${REGISTRY}/${IMAGE_NAME}:${TAG}"
+        buildah push "${REGISTRY}/${IMAGE_NAME}:${TAG}"
+      done
+
+      echo "Released version ${VERSION}"
+
+# ============================================================================
+# Summary
+# ============================================================================
+summary:
+  stage: summary
+  image: alpine:latest
+  when: always
+  script:
+    - |
+      {
+        echo "## Execution Environment Build Summary"
+        echo ""
+        echo "### Pipeline"
+        echo "- Pipeline: ${CI_PIPELINE_URL}"
+        echo "- Ref: ${CI_COMMIT_REF_NAME}"
+        echo "- Commit: ${CI_COMMIT_SHORT_SHA}"
+        echo ""
+        echo "### Authentication Status"
+        echo "| Provider | Configured |"
+        echo "|----------|------------|"
+        echo "| Galaxy Server Tokens | ${GALAXY_TOKENS_CONFIGURED:-unknown} |"
+        echo "| Git SCM Token | ${GIT_TOKEN_CONFIGURED:-unknown} |"
+        echo ""
+
+        if [ -n "$IMAGE_AGE_DAYS" ] && [ "$IMAGE_AGE_DAYS" != "0" ]; then
+          echo "### Base Image Status"
+          echo "- Age: ${IMAGE_AGE_DAYS} days"
+          echo "- Status: ${IMAGE_STATUS:-unknown}"
+          echo ""
+        fi
+
+        echo "### Image Details"
+        echo "- Registry: \`${REGISTRY}\`"
+        echo "- Image: \`${IMAGE_NAME}\`"
+        echo "- EE Directory: \`${EE_DIR}\`"
+        if [ -n "$IMAGE_DIGEST" ]; then
+          echo "- Digest: \`${IMAGE_DIGEST}\`"
+        fi
+      } | tee summary.md
+  artifacts:
+    paths:
+      - summary.md
+    when: always

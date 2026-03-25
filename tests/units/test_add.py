@@ -47,6 +47,7 @@ class ConfigDict(TypedDict):
         image: The image to be used while scaffolding devcontainer.
         role_name: The name of role to be used while scaffolding.
         skip_collection_check: Whether to skip collection path validation.
+        scm_provider: SCM provider for CI workflow generation.
     """
 
     creator_version: str
@@ -63,6 +64,7 @@ class ConfigDict(TypedDict):
     image: str
     role_name: str
     skip_collection_check: bool
+    scm_provider: str
 
 
 @pytest.fixture(name="cli_args")
@@ -91,6 +93,7 @@ def fixture_cli_args(tmp_path: Path, output: Output) -> ConfigDict:
         "image": "",
         "role_name": "",
         "skip_collection_check": False,
+        "scm_provider": "github",
     }
 
 
@@ -372,8 +375,8 @@ def test_run_success_add_ee_ci(
         monkeypatch: Pytest monkeypatch fixture.
 
     """
-    # Set the resource_type to ee-ci
     cli_args["resource_type"] = "ee-ci"
+    cli_args["scm_provider"] = "github"
     add = Add(
         Config(**cli_args),
     )
@@ -388,6 +391,9 @@ def test_run_success_add_ee_ci(
     cmp_result = dircmp(expected_ci, effective_ci)
     diff = has_differences(dcmp=cmp_result, errors=[])
     assert diff == [], diff
+
+    # GitLab CI file should NOT be created when scm_provider is github
+    assert not (tmp_path / ".gitlab-ci.yml").exists()
 
     # Test for overwrite prompt and failure with no overwrite option
     conflict_file = tmp_path / ".github" / "workflows" / "ee-build.yml"
@@ -407,6 +413,65 @@ def test_run_success_add_ee_ci(
 
     # expect a warning followed by ee-ci resource creation msg
     # when response to overwrite is yes.
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+    add.run()
+    result = capsys.readouterr().out
+    assert "already exists" in result, result
+    assert "Note: Resource added to" in result
+
+
+def test_run_success_add_ee_ci_gitlab(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    cli_args: ConfigDict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test Add.run() for adding an EE CI GitLab CI/CD pipeline.
+
+    Successfully adds GitLab CI pipeline to path.
+
+    Args:
+        capsys: Pytest fixture to capture stdout and stderr.
+        tmp_path: Temporary directory path.
+        cli_args: Dictionary, partial Add class object.
+        monkeypatch: Pytest monkeypatch fixture.
+
+    """
+    cli_args["resource_type"] = "ee-ci"
+    cli_args["scm_provider"] = "gitlab"
+    add = Add(
+        Config(**cli_args),
+    )
+    add.run()
+    result = capsys.readouterr().out
+    assert "Note: Resource added to" in result
+
+    # Verify the generated .gitlab-ci.yml matches the expected fixture
+    expected_gitlab_ci = tmp_path / ".gitlab-ci.yml"
+    effective_gitlab_ci = FIXTURES_DIR / "common" / "ee-ci" / ".gitlab-ci.yml"
+
+    assert expected_gitlab_ci.exists()
+    cmp_result = cmp(expected_gitlab_ci, effective_gitlab_ci, shallow=False)
+    assert cmp_result
+
+    # GitHub Actions directory should NOT be created when scm_provider is gitlab
+    assert not (tmp_path / ".github").exists()
+
+    # Test for overwrite prompt and failure with no overwrite option
+    conflict_file = tmp_path / ".gitlab-ci.yml"
+    conflict_file.write_text("stages: [build]")
+
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    fail_msg = (
+        "The destination directory contains files that will be overwritten."
+        " Please re-run ansible-creator with --overwrite to continue."
+    )
+    with pytest.raises(
+        CreatorError,
+        match=fail_msg,
+    ):
+        add.run()
+
     monkeypatch.setattr("builtins.input", lambda _: "y")
     add.run()
     result = capsys.readouterr().out

@@ -22,7 +22,7 @@ from ansible_creator.types import (
     validate_collection_type,
     validate_source_url,
 )
-from ansible_creator.utils import Copier, Walker, ask_yes_no
+from ansible_creator.utils import Copier, FileList, Walker, ask_yes_no
 
 
 if TYPE_CHECKING:
@@ -67,6 +67,7 @@ class Init:
         self._templar = Templar()
         self.output: Output = config.output
         self._role_name: str = config.role_name
+        self._scm_provider: str = config.scm_provider
 
         # Build the canonical EEConfig from JSON, file, or defaults, then
         # layer CLI flag overrides on top.
@@ -439,6 +440,9 @@ class Init:
         )
         paths = walker.collect_paths()
 
+        if self._project == "execution_env":
+            paths = self._filter_scm_paths(paths)
+
         copier = Copier(
             output=self.output,
         )
@@ -473,6 +477,24 @@ class Init:
                 raise CreatorError(msg)
 
         self.output.note(f"{self._project} project created at {self._init_path}")
+
+    def _filter_scm_paths(self, paths: FileList) -> FileList:
+        """Filter ee-ci paths to only include files for the selected SCM provider.
+
+        Args:
+            paths: The FileList of all collected paths.
+
+        Returns:
+            FileList with only the paths matching the chosen SCM provider.
+        """
+        filtered = FileList()
+        for path in paths:
+            if self._scm_provider == "github" and path.dest.name == ".gitlab-ci.yml":
+                continue
+            if self._scm_provider == "gitlab" and ".github" in path.dest.parts:
+                continue
+            filtered.append(path)
+        return filtered
 
     def _write_optional_files(self) -> None:
         """Write optional files based on configuration.
